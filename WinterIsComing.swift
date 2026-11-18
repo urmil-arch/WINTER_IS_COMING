@@ -33,6 +33,7 @@ enum Cfg {
 // MARK: - Find the Dock (needs Accessibility permission)
 
 @MainActor final class DockTracker {
+    static let shared = DockTracker()      // one instance for all screens, so macOS asks only once
     private var trusted = false
     private var warned = false
     var lastError = ""
@@ -348,14 +349,24 @@ final class SnowScene: SKScene {
     var t: CGFloat = 0
     let myPID = getpid()
     let world = SKNode()
-    let dockTracker = DockTracker()
+    let dockTracker = DockTracker.shared
+    var origin = CGPoint.zero                    // this screen's bottom-left corner in global Cocoa coordinates
+    weak var screen: NSScreen?
+    /// Height of the main screen: global window/Dock frames (origin top-left) are flipped against it
+    var primaryH: CGFloat { NSScreen.screens.first?.frame.height ?? size.height }
+    /// Mouse position in this scene's coordinates
+    var mouse: CGPoint { let m = NSEvent.mouseLocation; return CGPoint(x: m.x - origin.x, y: m.y - origin.y) }
+    /// Convert a global top-left-origin rect (CGWindow / Accessibility) to this scene's coordinates
+    func local(_ r: CGRect) -> CGRect {
+        CGRect(x: r.minX - origin.x, y: primaryH - r.maxY - origin.y, width: r.width, height: r.height)
+    }
     var dockPile: Pile?
     var dockRect: CGRect?
     var dockAcc: CGFloat = 1
     var lastDockStatus = ""
     var balls: [Snowball] = []
     weak var activeBall: Snowball?
-    var lastMouse = NSEvent.mouseLocation
+    var lastMouse = CGPoint.zero
     var ballTex: SKTexture?
     var dragBall: Snowball?
     var dragTarget = CGPoint.zero
@@ -495,7 +506,7 @@ final class SnowScene: SKScene {
     /// does it catch clicks, so you can grab the ball without clicking the window underneath.
     func updateMouseCapture() {
         guard let w = view?.window else { return }
-        let capture = dragBall != nil || ballAt(NSEvent.mouseLocation) != nil
+        let capture = dragBall != nil || ballAt(mouse) != nil
         if w.ignoresMouseEvents == capture { w.ignoresMouseEvents = !capture }
     }
 
@@ -576,7 +587,7 @@ final class SnowScene: SKScene {
         b.specks.zRotation -= (target.x - b.x) / b.r
         b.x = target.x
         b.y = target.y
-        lastMouse = NSEvent.mouseLocation
+        lastMouse = mouse
     }
 
     /// A ball dropped just above another ball (that isn't already a full snowman) gets stacked on it
@@ -700,7 +711,7 @@ final class SnowScene: SKScene {
     }
 
     func updateRolling() {
-        let m = NSEvent.mouseLocation     // same coordinates as the scene (origin bottom-left of main screen)
+        let m = mouse
         let dx = m.x - lastMouse.x
         lastMouse = m
         guard let p = surfaceUnderMouse(m) else { activeBall = nil; return }
@@ -904,7 +915,7 @@ final class SnowScene: SKScene {
 
     // Read all window frames (macOS origin is top-left, SpriteKit is bottom-left, so flip y)
     func pollWindows(dt: CGFloat) {
-        let H = size.height
+        let bounds = CGRect(origin: .zero, size: size)
         var newOrder: [(id: Int, rect: CGRect)] = []
         if let info = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] {
             for w in info {
@@ -915,8 +926,9 @@ final class SnowScene: SKScene {
                       let b = CGRect(dictionaryRepresentation: bd as CFDictionary) else { continue }
                 let alpha = (w[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 1
                 if alpha < 0.05 || b.width < 80 || b.height < 40 { continue }
-                newOrder.append((id: numN.intValue,
-                                 rect: CGRect(x: b.minX, y: H - b.maxY, width: b.width, height: b.height)))
+                let r = local(b)
+                if !r.intersects(bounds) { continue }   // window is on another display
+                newOrder.append((id: numN.intValue, rect: r))
             }
         }
 
@@ -968,19 +980,19 @@ final class SnowScene: SKScene {
         var r: CGRect? = nil
         var status: String
         if let f = dockTracker.frame() {
-            var s = CGRect(x: f.minX - Cfg.dockPad, y: size.height - f.maxY,
-                           width: f.width + 2 * Cfg.dockPad, height: f.height)
+            var s = local(f).insetBy(dx: -Cfg.dockPad, dy: 0)
             // The AX frame can reach a bit above the visible Dock shelf. When the Dock is always
             // shown, the space macOS reserves for it (bottom of visibleFrame) is a better top edge.
-            if let screen = NSScreen.screens.first {
+            if let screen = screen {
                 let reserved = screen.visibleFrame.minY - screen.frame.minY
                 if reserved > 10 && reserved < s.maxY { s.size.height = reserved - s.minY }
             }
             // Only handle a Dock that sits at the bottom of the screen and is currently on screen.
             // With auto-hide, a hidden Dock is reported below the screen edge, so it fails this check.
-            if s.width > s.height && s.minY < 40 && s.maxY > 8 {
+            // The Dock lives on one display only; other scenes see it off to the side and skip it.
+            if s.width > s.height && s.minY < 40 && s.maxY > 8 && s.maxX > 0 && s.minX < size.width {
                 r = s
-                status = "found at x=\(Int(s.minX)) width=\(Int(s.width)) top=\(Int(s.maxY)) (AX top \(Int(size.height - f.minY)), screen \(Int(size.width))x\(Int(size.height)))"
+                status = "found at x=\(Int(s.minX)) width=\(Int(s.width)) top=\(Int(s.maxY)) (AX top \(Int(primaryH - f.minY - origin.y)), screen \(Int(size.width))x\(Int(size.height)))"
             } else {
                 status = "ignored (not at bottom or hidden), AX frame = \(f)"
             }
@@ -1116,7 +1128,7 @@ final class SnowScene: SKScene {
     }
 }
 
-// MARK: - Transparent full-screen window + menu bar icon
+// MARK: - Transparent full-screen windows (one per display) + menu bar icon
 
 /// Lets the very first click reach the scene even though this app is never the active app
 final class OverlaySKView: SKView {
@@ -1128,15 +1140,12 @@ final class OverlayWindow: NSPanel {
     override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect { frameRect }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
-    var window: OverlayWindow!
-    var scene: SnowScene!
-    var statusItem: NSStatusItem!
-    var pauseItem: NSMenuItem!
-    var amountItems: [NSMenuItem] = []
+/// One transparent window + snow scene covering one display
+final class Overlay {
+    let window: OverlayWindow
+    let scene: SnowScene
 
-    func applicationDidFinishLaunching(_ notification: Notification) {
-        guard let screen = NSScreen.screens.first else { return }
+    init(screen: NSScreen) {
         // A non-activating panel can take a click (to grab a snowball) without stealing focus from your apps
         window = OverlayWindow(contentRect: screen.frame, styleMask: [.borderless, .nonactivatingPanel],
                                backing: .buffered, defer: false)
@@ -1148,6 +1157,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.ignoresMouseEvents = true          // clicks pass straight through
         window.level = .floating                  // above normal windows, below the Dock and menu bar
         window.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
+        window.isReleasedWhenClosed = false
 
         let view = OverlaySKView(frame: NSRect(origin: .zero, size: screen.frame.size))
         view.allowsTransparency = true
@@ -1155,10 +1165,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         view.ignoresSiblingOrder = true
         scene = SnowScene(size: screen.frame.size)
         scene.scaleMode = .resizeFill
+        scene.origin = screen.frame.origin
+        scene.screen = screen
         view.presentScene(scene)
         window.contentView = view
         window.setFrame(screen.frame, display: true)
-        window.orderFrontRegardless()
+    }
+
+    var view: SKView? { window.contentView as? SKView }
+
+    func move(to screen: NSScreen) {
+        scene.origin = screen.frame.origin
+        scene.screen = screen
+        window.setFrame(screen.frame, display: true)
+    }
+}
+
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    var overlays: [Overlay] = []
+    var paused = false
+    var statusItem: NSStatusItem!
+    var pauseItem: NSMenuItem!
+    var amountItems: [NSMenuItem] = []
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        buildOverlays()
 
         setupMenu()
         NotificationCenter.default.addObserver(self, selector: #selector(screensChanged),
@@ -1175,14 +1206,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Snow on every connected display
+    func buildOverlays() {
+        for o in overlays { o.window.orderOut(nil); o.window.close() }
+        overlays = NSScreen.screens.map { Overlay(screen: $0) }
+        for o in overlays {
+            o.scene.isPaused = paused
+            if !paused { o.window.orderFrontRegardless() }
+        }
+    }
+
     @objc func suspendRendering() {
-        (window.contentView as? SKView)?.isPaused = true
+        for o in overlays { o.view?.isPaused = true }
     }
 
     @objc func resumeRendering() {
         // Stay paused if the user paused snow from the menu
-        guard !scene.isPaused else { return }
-        (window.contentView as? SKView)?.isPaused = false
+        guard !paused else { return }
+        for o in overlays { o.view?.isPaused = false }
     }
 
     func setupMenu() {
@@ -1217,14 +1258,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func togglePause() {
-        scene.isPaused.toggle()
-        if scene.isPaused {
-            window.orderOut(nil)
-            pauseItem.title = "Resume Snow"
-        } else {
-            window.orderFrontRegardless()
-            pauseItem.title = "Pause Snow"
+        paused.toggle()
+        for o in overlays {
+            o.scene.isPaused = paused
+            if paused { o.window.orderOut(nil) } else { o.window.orderFrontRegardless() }
         }
+        pauseItem.title = paused ? "Resume Snow" : "Pause Snow"
     }
 
     @objc func setAmount(_ sender: NSMenuItem) {
@@ -1232,11 +1271,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         for it in amountItems { it.state = (it === sender) ? .on : .off }
     }
 
-    @objc func clearSnow() { scene.clearAll() }
+    @objc func clearSnow() { for o in overlays { o.scene.clearAll() } }
 
     @objc func screensChanged() {
-        guard let screen = NSScreen.screens.first else { return }
-        window.setFrame(screen.frame, display: true)
+        let screens = NSScreen.screens
+        if screens.count == overlays.count {
+            // Same displays, maybe moved or resized: keep the snow, just follow them
+            for (o, s) in zip(overlays, screens) { o.move(to: s) }
+        } else {
+            // A display was plugged in or removed
+            buildOverlays()
+        }
     }
 }
 
