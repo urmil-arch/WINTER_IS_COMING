@@ -195,6 +195,11 @@ let layers: [Layer] = [
         node.addChild(specks)
     }
 
+    func texture(body b: SKTexture?, specks s: SKTexture?) {
+        if let b = b { body.texture = b }
+        if let s = s { specks.texture = s }
+    }
+
     func layout() {
         node.position = CGPoint(x: x, y: y)
         let d = CGSize(width: r * 2, height: r * 2)
@@ -374,6 +379,8 @@ final class SnowScene: SKScene {
     var dragVel = CGVector.zero
     var speckTex: SKTexture?
     static let dockID = -2
+    /// The scenes of all displays, so a snowball can move from one display to another
+    static var peers: [SnowScene] = []
 
     override func didMove(to view: SKView) {
         backgroundColor = .clear
@@ -496,7 +503,12 @@ final class SnowScene: SKScene {
         }
         stepFlakes(dt)
         updateMouseCapture()
-        if let b = dragBall { stepDrag(b, dt) } else { updateRolling() }
+        if let b = dragBall {
+            // Checked by polling: after a ball moves to another display, its mouse-up goes to the old window
+            if NSEvent.pressedMouseButtons & 1 == 0 { finishDrag() } else { stepDrag(b, dt) }
+        } else {
+            updateRolling()
+        }
         stepBalls(dt)
     }
 
@@ -556,11 +568,9 @@ final class SnowScene: SKScene {
         dragVel = .zero
     }
 
-    override func mouseDragged(with event: NSEvent) {
-        dragTarget = event.location(in: self)
-    }
+    override func mouseUp(with event: NSEvent) { finishDrag() }
 
-    override func mouseUp(with event: NSEvent) {
+    func finishDrag() {
         guard let b = dragBall else { return }
         dragBall = nil
         b.dragging = false
@@ -579,6 +589,7 @@ final class SnowScene: SKScene {
     }
 
     func stepDrag(_ b: Snowball, _ dt: CGFloat) {
+        dragTarget = mouse
         let target = CGPoint(x: dragTarget.x + dragOffset.x, y: dragTarget.y + dragOffset.y)
         if dt > 0 {
             let v = CGVector(dx: (target.x - b.x) / dt, dy: (target.y - b.y) / dt)
@@ -810,6 +821,7 @@ final class SnowScene: SKScene {
         while i >= 0 {
             let b = balls[i]
             var gone = false
+            var movedAway = false
             if b.falling {
                 if b.decor != nil { b.decor?.removeFromParent(); b.decor = nil }
                 b.node.zPosition = 6.5
@@ -821,11 +833,14 @@ final class SnowScene: SKScene {
                 if b.vel.dy < 0, let p = landingSurface(x: b.x, from: prevBottom, to: b.y - b.r) {
                     splat(b, on: p)                  // falling snowballs burst into a heap of snow
                     gone = true
+                } else if !inBounds(b), handOff(b) {
+                    movedAway = true                 // fell over the edge onto another display
                 } else if b.y < -b.r * 2 || b.x < -100 || b.x > size.width + 100 {
                     gone = true
                 }
             } else if b.dragging {
-                // position is set by stepDrag
+                // position is set by stepDrag; carried onto another display, it moves there
+                if !inBounds(b), handOff(b) { movedAway = true }
             } else if let under = b.below {
                 if under.falling || under.dragging {
                     b.drop(vel: CGVector(dx: under.vel.dx + rnd(-40, 40), dy: max(under.vel.dy, 0) + rnd(30, 80)))
@@ -844,7 +859,9 @@ final class SnowScene: SKScene {
             } else {
                 b.drop(vel: .zero)                 // lost its support (e.g. the ball below was removed)
             }
-            if gone {
+            if movedAway {
+                balls.remove(at: i)
+            } else if gone {
                 b.node.removeFromParent()
                 balls.remove(at: i)
             } else {
@@ -852,6 +869,35 @@ final class SnowScene: SKScene {
             }
             i -= 1
         }
+    }
+
+    func inBounds(_ b: Snowball) -> Bool {
+        b.x >= 0 && b.x < size.width && b.y >= 0 && b.y < size.height
+    }
+
+    /// Move a snowball whose centre is now over another display into that display's scene.
+    /// Returns false if no other display is under it.
+    func handOff(_ b: Snowball) -> Bool {
+        let g = CGPoint(x: b.x + origin.x, y: b.y + origin.y)
+        guard let other = SnowScene.peers.first(where: {
+            $0 !== self && CGRect(origin: $0.origin, size: $0.size).contains(g)
+        }) else { return false }
+        b.node.removeFromParent()
+        b.x = g.x - other.origin.x
+        b.y = g.y - other.origin.y
+        b.texture(body: other.ballTex, specks: other.speckTex)
+        other.world.addChild(b.node)
+        other.balls.append(b)
+        if activeBall === b { activeBall = nil }
+        if dragBall === b {
+            other.dragBall = b
+            other.dragOffset = dragOffset
+            other.dragVel = dragVel
+            dragBall = nil
+        }
+        b.layout()
+        other.trimBalls()
+        return true
     }
 
     /// First surface a falling ball hits between two heights: the Dock, then window tops (front to back),
@@ -1210,6 +1256,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func buildOverlays() {
         for o in overlays { o.window.orderOut(nil); o.window.close() }
         overlays = NSScreen.screens.map { Overlay(screen: $0) }
+        SnowScene.peers = overlays.map { $0.scene }
         for o in overlays {
             o.scene.isPaused = paused
             if !paused { o.window.orderFrontRegardless() }
